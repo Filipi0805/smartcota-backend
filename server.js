@@ -1,142 +1,171 @@
-const express  = require('express');
-const cors     = require('cors');
-const jwt      = require('jsonwebtoken');
-const bcrypt   = require('bcryptjs');
-const Anthropic = require('@anthropic-ai/sdk');
-const fs       = require('fs');
-const path     = require('path');
+const express     = require('express');
+const cors        = require('cors');
+const helmet      = require('helmet');
+const rateLimit   = require('express-rate-limit');
+const jwt         = require('jsonwebtoken');
+const bcrypt      = require('bcryptjs');
+const Anthropic   = require('@anthropic-ai/sdk');
+const { Pool }    = require('pg');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '30mb' })); // imagens podem ser grandes
 
-// ── Variáveis de ambiente ────────────────────────────────────────────────
-const JWT_SECRET       = process.env.JWT_SECRET       || 'smartcota-chave-secreta-2024';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // configurar no Render
-const PORT             = process.env.PORT              || 3000;
+const JWT_SECRET        = process.env.JWT_SECRET;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const DATABASE_URL      = process.env.DATABASE_URL;
+const PORT              = process.env.PORT || 3000;
+const FRONTEND_URL      = process.env.FRONTEND_URL || 'https://filipi0805.github.io';
 
-// ── Persistência simples em arquivo (sobrevive a deploys no Render) ───────
-const DATA_FILE = path.join('/tmp', 'smartcota_data.json');
+if (!JWT_SECRET)        console.error('JWT_SECRET nao definido!');
+if (!ANTHROPIC_API_KEY) console.error('ANTHROPIC_API_KEY nao definido!');
+if (!DATABASE_URL)      console.error('DATABASE_URL nao definido!');
 
-const carregarDados = () => {
-  try {
-    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {}
-  return { users: [], dados: {} };
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id        BIGSERIAL PRIMARY KEY,
+      nome      TEXT NOT NULL,
+      email     TEXT UNIQUE NOT NULL,
+      hash      TEXT NOT NULL,
+      criado_em TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS consorcios_dados (
+      usuario_id BIGINT PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+      dados      JSONB NOT NULL DEFAULT '[]',
+      atualizado TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  console.log('Banco de dados pronto.');
 };
 
-const salvarDados = (db) => {
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify(db)); } catch {}
-};
+app.use(helmet());
+app.use(cors({
+  origin: [FRONTEND_URL, 'http://localhost:3000', 'http://127.0.0.1:5500'],
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.use(express.json({ limit: '30mb' }));
 
-let db = carregarDados();
-// db.users  → [ {id, nome, email, hash} ]
-// db.dados  → { userId: [ ...consorcios ] }
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  message: { erro: 'Muitas tentativas. Aguarde 15 minutos.' }
+});
+const cadastroLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 5,
+  message: { erro: 'Muitos cadastros deste IP. Aguarde uma hora.' }
+});
+const iaLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 30,
+  message: { error: { message: 'Limite de analises atingido. Aguarde uma hora.' } }
+});
 
-// ── Middleware de autenticação ─────────────────────────────────────────────
 const autenticar = (req, res, next) => {
   const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer '))
-    return res.status(401).json({ erro: 'Token não fornecido.' });
-  try {
-    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ erro: 'Token inválido ou expirado.' });
-  }
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ erro: 'Token nao fornecido.' });
+  try { req.user = jwt.verify(auth.slice(7), JWT_SECRET); next(); }
+  catch { res.status(401).json({ erro: 'Token invalido ou expirado.' }); }
 };
 
-// ── Health check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', app: 'SmartCota Backend' }));
 
-// ── AUTH: Cadastro ─────────────────────────────────────────────────────────
-app.post('/auth/registro', async (req, res) => {
+app.post('/auth/registro', cadastroLimiter, async (req, res) => {
   const { nome, email, senha } = req.body || {};
-  if (!nome || !email || !senha)
-    return res.status(400).json({ erro: 'Preencha nome, email e senha.' });
-  if (senha.length < 6)
-    return res.status(400).json({ erro: 'Senha deve ter pelo menos 6 caracteres.' });
-  if (db.users.find(u => u.email === email))
-    return res.status(400).json({ erro: 'Email já cadastrado.' });
-
-  const hash = await bcrypt.hash(senha, 10);
-  const usuario = { id: Date.now(), nome: nome.trim(), email: email.trim().toLowerCase(), hash };
-  db.users.push(usuario);
-  salvarDados(db);
-
-  const token = jwt.sign({ id: usuario.id, nome: usuario.nome, email: usuario.email }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, usuario: { id: usuario.id, nome: usuario.nome, email: usuario.email } });
-});
-
-// ── AUTH: Login ────────────────────────────────────────────────────────────
-app.post('/auth/login', async (req, res) => {
-  const { email, senha } = req.body || {};
-  if (!email || !senha)
-    return res.status(400).json({ erro: 'Preencha email e senha.' });
-
-  const u = db.users.find(x => x.email === email.trim().toLowerCase());
-  if (!u) return res.status(401).json({ erro: 'Email ou senha incorretos.' });
-
-  const ok = await bcrypt.compare(senha, u.hash);
-  if (!ok) return res.status(401).json({ erro: 'Email ou senha incorretos.' });
-
-  const token = jwt.sign({ id: u.id, nome: u.nome, email: u.email }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, usuario: { id: u.id, nome: u.nome, email: u.email } });
-});
-
-// ── CONSÓRCIOS: Buscar ─────────────────────────────────────────────────────
-app.get('/consorcios', autenticar, (req, res) => {
-  res.json(db.dados[req.user.id] || []);
-});
-
-// ── CONSÓRCIOS: Salvar ─────────────────────────────────────────────────────
-app.post('/consorcios', autenticar, (req, res) => {
-  const lista = req.body?.dados;
-  if (!Array.isArray(lista))
-    return res.status(400).json({ erro: 'Dados inválidos.' });
-  db.dados[req.user.id] = lista;
-  salvarDados(db);
-  res.json({ ok: true });
-});
-
-// ── IA: Analisar documento ─────────────────────────────────────────────────
-app.post('/ia/analisar', autenticar, async (req, res) => {
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({
-      error: { message: 'Chave da API Anthropic não configurada no servidor. Adicione ANTHROPIC_API_KEY nas variáveis de ambiente do Render.' }
-    });
+  if (!nome || !email || !senha) return res.status(400).json({ erro: 'Preencha todos os campos.' });
+  if (senha.length < 6) return res.status(400).json({ erro: 'Senha deve ter pelo menos 6 caracteres.' });
+  const emailLimpo = email.trim().toLowerCase();
+  try {
+    const existe = await pool.query('SELECT id FROM usuarios WHERE email=$1', [emailLimpo]);
+    if (existe.rows.length) return res.status(400).json({ erro: 'Email ja cadastrado.' });
+    const hash = await bcrypt.hash(senha, 12);
+    const r = await pool.query(
+      'INSERT INTO usuarios (nome,email,hash) VALUES ($1,$2,$3) RETURNING id,nome,email',
+      [nome.trim(), emailLimpo, hash]
+    );
+    const u = r.rows[0];
+    await pool.query(
+      'INSERT INTO consorcios_dados (usuario_id,dados) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [u.id, '[]']
+    );
+    const token = jwt.sign({ id:u.id, nome:u.nome, email:u.email }, JWT_SECRET, { expiresIn:'30d' });
+    res.json({ token, usuario: { id:u.id, nome:u.nome, email:u.email } });
+  } catch(err) {
+    console.error('[Cadastro]', err.message);
+    res.status(500).json({ erro: 'Erro ao criar conta.' });
   }
+});
 
+app.post('/auth/login', loginLimiter, async (req, res) => {
+  const { email, senha } = req.body || {};
+  if (!email || !senha) return res.status(400).json({ erro: 'Preencha email e senha.' });
+  try {
+    const r = await pool.query('SELECT * FROM usuarios WHERE email=$1', [email.trim().toLowerCase()]);
+    const u = r.rows[0];
+    if (!u) return res.status(401).json({ erro: 'Email ou senha incorretos.' });
+    const ok = await bcrypt.compare(senha, u.hash);
+    if (!ok) return res.status(401).json({ erro: 'Email ou senha incorretos.' });
+    const token = jwt.sign({ id:u.id, nome:u.nome, email:u.email }, JWT_SECRET, { expiresIn:'30d' });
+    res.json({ token, usuario: { id:u.id, nome:u.nome, email:u.email } });
+  } catch(err) {
+    console.error('[Login]', err.message);
+    res.status(500).json({ erro: 'Erro ao fazer login.' });
+  }
+});
+
+app.get('/consorcios', autenticar, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT dados FROM consorcios_dados WHERE usuario_id=$1', [req.user.id]);
+    res.json(r.rows[0]?.dados || []);
+  } catch(err) {
+    console.error('[GET consorcios]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar dados.' });
+  }
+});
+
+app.post('/consorcios', autenticar, async (req, res) => {
+  const lista = req.body?.dados;
+  if (!Array.isArray(lista)) return res.status(400).json({ erro: 'Dados invalidos.' });
+  try {
+    await pool.query(`
+      INSERT INTO consorcios_dados (usuario_id,dados,atualizado)
+      VALUES ($1,$2,NOW())
+      ON CONFLICT (usuario_id) DO UPDATE SET dados=$2, atualizado=NOW()
+    `, [req.user.id, JSON.stringify(lista)]);
+    res.json({ ok: true });
+  } catch(err) {
+    console.error('[POST consorcios]', err.message);
+    res.status(500).json({ erro: 'Erro ao salvar dados.' });
+  }
+});
+
+app.post('/ia/analisar', autenticar, iaLimiter, async (req, res) => {
+  if (!ANTHROPIC_API_KEY)
+    return res.status(500).json({ error: { message: 'Chave da API nao configurada.' } });
   const { messages } = req.body || {};
-  if (!messages?.length)
-    return res.status(400).json({ error: { message: 'Nenhuma mensagem enviada.' } });
-
+  if (!messages?.length) return res.status(400).json({ error: { message: 'Nenhuma mensagem.' } });
   try {
     const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-    const response = await client.messages.create({
-      model:      'claude-sonnet-4-5',   // suporta visão (imagens + PDFs)
-      max_tokens: 4096,
-      messages
-    });
-
+    const response = await client.messages.create({ model:'claude-sonnet-4-5', max_tokens:4096, messages });
     res.json(response);
-
-  } catch (err) {
-    console.error('[IA] Erro:', err.message);
+  } catch(err) {
+    console.error('[IA]', err.message);
     const status = err.status || 500;
     let msg = err.message || 'Erro ao chamar a IA.';
-
-    if (status === 401) msg = 'Chave API inválida. Verifique ANTHROPIC_API_KEY no Render.';
-    if (status === 429) msg = 'Limite de requisições atingido. Aguarde alguns segundos e tente novamente.';
-    if (status === 529) msg = 'Serviço da IA sobrecarregado. Tente novamente em instantes.';
-
+    if (status === 401) msg = 'Chave API invalida.';
+    if (status === 429) msg = 'Limite atingido. Aguarde.';
     res.status(status).json({ error: { message: msg } });
   }
 });
 
-// ── Start ──────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`✅ SmartCota backend rodando na porta ${PORT}`);
-  console.log(`   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY ? '✓ configurada' : '✗ NÃO CONFIGURADA'}`);
-});
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`SmartCota backend na porta ${PORT}`);
+    console.log(`JWT_SECRET: ${JWT_SECRET ? 'OK' : 'FALTANDO'}`);
+    console.log(`ANTHROPIC:  ${ANTHROPIC_API_KEY ? 'OK' : 'FALTANDO'}`);
+    console.log(`DATABASE:   ${DATABASE_URL ? 'OK' : 'FALTANDO'}`);
+    console.log(`CORS:       ${FRONTEND_URL}`);
+  });
+}).catch(err => { console.error('Erro no banco:', err.message); process.exit(1); });

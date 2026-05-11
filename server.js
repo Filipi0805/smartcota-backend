@@ -147,8 +147,8 @@ app.post('/ia/analisar', autenticar, iaLimiter, async (req, res) => {
   const { messages } = req.body || {};
   if (!messages?.length) return res.status(400).json({ error: { message: 'Nenhuma mensagem.' } });
   try {
-    const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-    const response = await client.messages.create({ model:'claude-haiku-4-5-20251001', max_tokens:4096, messages });
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const response = await client.messages.create({ model: 'claude-haiku-4-5', max_tokens:4096, messages });
     res.json(response);
   } catch(err) {
     console.error('[IA]', err.message);

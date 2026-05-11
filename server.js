@@ -44,7 +44,7 @@ const initDB = async () => {
 
 app.use(helmet());
 app.use(cors({
-  origin: [FRONTEND_URL, 'http://localhost:3000', 'http://127.0.0.1:5500'],
+  origin: ['https://filipi0805.github.io', 'http://localhost:3000', 'http://127.0.0.1:5500'],
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization']
 }));

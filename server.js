@@ -1,3 +1,7 @@
+require('dotenv').config();
+
+const { MercadoPagoConfig, PreApproval } = require('mercadopago');
+
 const express     = require('express');
 const cors        = require('cors');
 const helmet      = require('helmet');
@@ -159,7 +163,35 @@ app.post('/ia/analisar', autenticar, iaLimiter, async (req, res) => {
     res.status(status).json({ error: { message: msg } });
   }
 });
+// ══ MERCADO PAGO - ASSINATURA ══
+const mp = new MercadoPagoConfig({ 
+  accessToken: process.env.MP_ACCESS_TOKEN 
+});
 
+app.post('/assinatura/criar', autenticar, async (req, res) => {
+  try {
+    const { email } = req.user;
+    const preApproval = new PreApproval(mp);
+    const resultado = await preApproval.create({
+      body: {
+        reason: 'SmartCota Mensal',
+        auto_recurring: {
+          frequency: 1,
+          frequency_type: 'months',
+          transaction_amount: 89.90,
+          currency_id: 'BRL'
+        },
+        payer_email: email,
+        back_url: 'https://filipi0805.github.io/smartcota-app/',
+        status: 'pending'
+      }
+    });
+    res.json({ url: resultado.init_point });
+  } catch(err) {
+    console.error('[MP]', err.message);
+    res.status(500).json({ erro: 'Erro ao criar assinatura.' });
+  }
+});
 initDB().then(() => {
   app.listen(PORT, () => {
     console.log(`SmartCota backend na porta ${PORT}`);

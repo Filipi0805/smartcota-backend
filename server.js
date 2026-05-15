@@ -193,24 +193,14 @@ app.post('/assinatura/criar', autenticar, async (req, res) => {
     res.status(500).json({ erro: 'Erro ao criar assinatura.' });
   }
 });
-// Webhook Mercado Pago
-app.post('/webhook/mp', async (req, res) => {
+
+app.get('/auth/me', autenticar, async (req, res) => {
   try {
-    const { type, data } = req.body;
-    if(type === 'preapproval') {
-      const preApproval = new PreApproval(mp);
-      const info = await preApproval.get({ id: data.id });
-      if(info.status === 'authorized') {
-        await pool.query(
-          'UPDATE usuarios SET assinatura=$1 WHERE email=$2',
-          ['ativo', info.payer_email]
-        );
-      }
-    }
-    res.sendStatus(200);
+    const r = await pool.query('SELECT id,nome,email,assinatura FROM usuarios WHERE id=$1', [req.user.id]);
+    res.json(r.rows[0]);
   } catch(err) {
-    console.error('[Webhook]', err.message);
-    res.sendStatus(500);
+    console.error('[auth/me]', err.message);
+    res.status(500).json({ erro: 'Erro ao buscar usuário.' });
   }
 });
 initDB().then(() => {

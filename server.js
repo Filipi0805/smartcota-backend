@@ -35,7 +35,8 @@ const initDB = async () => {
       nome      TEXT NOT NULL,
       email     TEXT UNIQUE NOT NULL,
       hash      TEXT NOT NULL,
-      criado_em TIMESTAMPTZ DEFAULT NOW()
+      criado_em TIMESTAMPTZ DEFAULT NOW(),
+      assinatura TEXT DEFAULT 'inativo'
     );
     CREATE TABLE IF NOT EXISTS consorcios_dados (
       usuario_id BIGINT PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -190,6 +191,26 @@ app.post('/assinatura/criar', autenticar, async (req, res) => {
   } catch(err) {
     console.error('[MP]', err.message);
     res.status(500).json({ erro: 'Erro ao criar assinatura.' });
+  }
+});
+// Webhook Mercado Pago
+app.post('/webhook/mp', async (req, res) => {
+  try {
+    const { type, data } = req.body;
+    if(type === 'preapproval') {
+      const preApproval = new PreApproval(mp);
+      const info = await preApproval.get({ id: data.id });
+      if(info.status === 'authorized') {
+        await pool.query(
+          'UPDATE usuarios SET assinatura=$1 WHERE email=$2',
+          ['ativo', info.payer_email]
+        );
+      }
+    }
+    res.sendStatus(200);
+  } catch(err) {
+    console.error('[Webhook]', err.message);
+    res.sendStatus(500);
   }
 });
 initDB().then(() => {

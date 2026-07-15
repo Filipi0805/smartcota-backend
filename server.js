@@ -211,4 +211,9 @@ initDB().then(() => {
     console.log(`DATABASE:   ${DATABASE_URL ? 'OK' : 'FALTANDO'}`);
     console.log(`CORS:       ${FRONTEND_URL}`);
   });
+  // Manter servidor acordado
+setInterval(() => {
+  fetch('https://smartcota-backend.onrender.com/')
+    .catch(() => {});
+}, 14 * 60 * 1000);
 }).catch(err => { console.error('Erro no banco:', err.message); process.exit(1); });
